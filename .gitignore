@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.pnp.*
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/node_modules
+frontend/.next
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kestra
+kestra-infra/kestra-wd/
+kestra-data/
+
+# Docker
+*.log
+
+# Debug
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Misc
+coverage/
+.cache/
