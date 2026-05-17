@@ -1,0 +1,211 @@
+id: b0bot_enrichment
+namespace: b0bot
+description: |
+  AI enrichment of cybersecurity articles.
+  Consumes from Kafka topic raw.rss, runs Groq to
+  extract category, severity, and entities, then inserts the record
+  into Postgres articles_metadata and caches the latest headline in Redis.
+
+labels:
+  project: b0bot
+  stage: enrichment
+
+triggers:
+  - id: from_raw_rss
+    type: io.kestra.plugin.kafka.RealtimeTrigger
+    topic: raw.rss
+    properties:
+      bootstrap.servers: "kafka:29092"
+    serdeProperties:
+      keyDeserializer: "org.apache.kafka.common.serialization.StringDeserializer"
+      valueDeserializer: "org.apache.kafka.common.serialization.StringDeserializer"
+    groupId: b0bot-enrichment
+
+variables:
+  enrichment_schema: |
+    {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": ["malware", "phishing", "ransomware", "vulnerability", "data_breach", "nation_state", "other"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "entities": {
+          "type": "array",
+          "items": {"type": "string"},
+          "maxItems": 10
+        }
+      },
+      "required": ["category", "severity", "entities"],
+      "additionalProperties": false
+    }
+
+tasks:
+  - id: parse_record
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Parse the Kafka payload (JSON string) into a structured map.
+    containerImage: python:3.11-slim
+    env:
+      RAW_PAYLOAD: "{{ trigger.value }}"
+    beforeCommands:
+      - pip install --quiet kestra
+    commands:
+      - python parse.py
+    inputFiles:
+      parse.py: |
+        import json
+        import os
+        from kestra import Kestra
+        
+        raw = os.environ.get("RAW_PAYLOAD", "{}")
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            rec = {"title": raw, "link": "", "source_name": "unknown"}
+            
+        Kestra.outputs({
+            "title": (rec.get("title") or "").strip()[:1024],
+            "link": (rec.get("link") or "").strip()[:2048],
+            "source_name": (rec.get("source_name") or "unknown").strip()[:128],
+        })
+
+  - id: groq_enrich
+    type: io.kestra.plugin.scripts.python.Script
+    description: Enrichment via Groq llama-3.1-8b-instant.
+    containerImage: python:3.11-slim
+    env:
+      TITLE: "{{ outputs.parse_record.vars.title }}"
+      SOURCE_NAME: "{{ outputs.parse_record.vars.source_name }}"
+      LINK: "{{ outputs.parse_record.vars.link }}"
+      SCHEMA: "{{ variables.enrichment_schema }}"
+    beforeCommands:
+      - pip install --quiet groq==0.11.0 kestra
+    script: |
+      import os
+      from groq import Groq
+      from kestra import Kestra
+      
+      title = os.environ.get("TITLE", "")
+      source_name = os.environ.get("SOURCE_NAME", "")
+      link = os.environ.get("LINK", "")
+      schema = os.environ.get("SCHEMA", "")
+      
+      system_prompt = (
+          "You are a cybersecurity intelligence analyst. Given a news headline, "
+          "classify the article and extract named entities (CVE ids, malware "
+          "families, threat-actor handles, affected products, country codes). "
+          "Be conservative: pick the most specific category that fits.\n"
+          f"You MUST output valid JSON matching this schema exactly:\n{schema}"
+      )
+      user_prompt = (
+          "Classify the following cybersecurity article.\n\n"
+          f"Title: {title}\n"
+          f"Source: {source_name}\n"
+          f"Link: {link}\n\n"
+          "Respond with valid JSON matching the schema exactly. No commentary."
+      )
+      
+      client = Groq(api_key=os.environ["SECRET_GROQ_API_KEY"])
+      completion = client.chat.completions.create(
+          model="llama-3.1-8b-instant",
+          messages=[
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_prompt},
+          ],
+          response_format={"type": "json_object"},
+      )
+      result = completion.choices[0].message.content
+      Kestra.outputs({"textOutput": result})
+
+  - id: parse_enrichment
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Strip markdown fences from the LLM output and expose flat fields for SQL.
+    containerImage: python:3.11-slim
+    env:
+      GROQ_OUT: "{{ outputs.groq_enrich.textOutput | default('') }}"
+    beforeCommands:
+      - pip install --quiet kestra
+    commands:
+      - python parse_enrichment.py
+    inputFiles:
+      parse_enrichment.py: |
+        import json
+        import os
+        from kestra import Kestra
+        
+        raw = os.environ.get("GROQ_OUT", "")
+            
+        stripped = raw.strip()
+        if stripped.startswith("```json"):
+            stripped = stripped[7:]
+        elif stripped.startswith("```"):
+            stripped = stripped[3:]
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+        
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            data = {"category": "other", "severity": "medium", "entities": []}
+            
+        entities = data.get("entities", [])
+        if not isinstance(entities, list):
+            entities = []
+            
+        Kestra.outputs({
+            "category": str(data.get("category", "other")).strip().lower() or "other",
+            "severity": str(data.get("severity", "medium")).strip().lower() or "medium",
+            "entities": json.dumps(entities),
+        })
+
+  - id: insert_article
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    description: Persist the enriched record into articles_metadata.
+    url: "jdbc:postgresql://postgres:5432/kestra"
+    username: "{{ secret('POSTGRES_USER') }}"
+    password: "{{ secret('POSTGRES_PASSWORD') }}"
+    sql: |
+      INSERT INTO articles_metadata 
+        (id, headline, full_text, source_url, category, severity, entities)
+      VALUES 
+        (gen_random_uuid(), :headline, :full_text, :source_url, :category, :severity, CAST(:entities AS JSONB))
+      ON CONFLICT (source_url) DO UPDATE 
+      SET 
+        category = EXCLUDED.category,
+        severity = EXCLUDED.severity,
+        entities = EXCLUDED.entities;
+    parameters:
+      headline: "{{ outputs.parse_record.vars.title | default('') }}"
+      full_text: "{{ outputs.parse_record.vars.title | default('') }}"
+      source_url: "{{ outputs.parse_record.vars.link | default('') }}"
+      category: "{{ outputs.parse_enrichment.vars.category | default('other') }}"
+      severity: "{{ outputs.parse_enrichment.vars.severity | default('medium') }}"
+      entities: "{{ outputs.parse_enrichment.vars.entities }}"
+
+  - id: cache_latest
+    type: io.kestra.plugin.redis.string.Set
+    description: Cache the latest headline in Redis under latest_cyber_news.
+    url: "redis://redis:6379/0"
+    key: "latest_cyber_news"
+    value: |
+      {{ outputs.parse_record.vars.title }} || {{ outputs.parse_record.vars.link }}
+
+  - id: log_outcome
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Enriched record: title="{{ outputs.parse_record.vars.title }}"
+      source={{ outputs.parse_record.vars.source_name }}
+      provider=groq
+
+errors:
+  - id: fail_on_unhandled
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ true }}"
+    message: |
+      Enrichment failed for record {{ outputs.parse_record.vars.title }}.
+      Groq state: {{ tasks.groq_enrich.state }}
