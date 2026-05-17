@@ -1,0 +1,108 @@
+id: b0bot_multi_source_ingest
+namespace: b0bot
+description: |
+  Hourly multi-source ingestion for the B0bot cybersecurity pipeline.
+  Scrapes 3 RSS feeds and 2 HTML pages, then produces each article
+  as a JSON record to the Kafka topic raw.rss.
+labels:
+  project: b0bot
+  stage: ingestion
+
+triggers:
+  - id: hourly
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@hourly"
+
+tasks:
+  - id: scrape_sources
+    type: io.kestra.plugin.scripts.python.Commands
+    description: Scrape 3 RSS + 2 HTML sources and expose records as a flow variable.
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install --quiet feedparser==6.0.10 requests==2.31.0 beautifulsoup4==4.12.3 lxml==5.2.1 kestra
+    commands:
+      - python scrape.py
+    inputFiles:
+      scrape.py: |
+        import json
+        import sys
+        import feedparser
+        import requests
+        from bs4 import BeautifulSoup
+        from kestra import Kestra
+        
+        SOURCES = [
+            {"name": "TheHackerNews",     "type": "rss",  "url": "https://thehackernews.com/rss.xml"},
+            {"name": "KrebsOnSecurity",   "type": "rss",  "url": "https://krebsonsecurity.com/feed/"},
+            {"name": "BleepingComputer",  "type": "rss",  "url": "https://www.bleepingcomputer.com/feed/"},
+            {"name": "CISA-Advisories",   "type": "html", "url": "https://www.cisa.gov/news-events/cybersecurity-advisories"},
+            {"name": "NCSC-Threats",      "type": "html", "url": "https://www.ncsc.gov.uk/section/keep-up-to-date/threats"},
+        ]
+        records = []
+        for src in SOURCES:
+            try:
+                if src["type"] == "rss":
+                    feed = feedparser.parse(src["url"])
+                    for entry in feed.entries[:10]:
+                        link = entry.get("link", "")
+                        title = entry.get("title", "").strip()
+                        if title and link:
+                            # Format specifically for Kestra's Kafka Producer plugin
+                            payload = json.dumps({
+                                "title": title,
+                                "link": link,
+                                "source_name": src["name"],
+                            })
+                            records.append({
+                                "key": src["name"],
+                                "value": payload
+                            })
+                else:
+                    r = requests.get(
+                        src["url"],
+                        timeout=15,
+                        headers={"User-Agent": "B0bot/1.0 (+https://b0bot.local)"},
+                    )
+                    r.raise_for_status()
+                    soup = BeautifulSoup(r.text, "lxml")
+                    for a in soup.select("a"):
+                        title = a.get_text(strip=True)
+                        link = a.get("href", "") or ""
+                        if 15 <= len(title) <= 240 and link.startswith("http"):
+                            # Format specifically for Kestra's Kafka Producer plugin
+                            payload = json.dumps({
+                                "title": title,
+                                "link": link,
+                                "source_name": src["name"],
+                            })
+                            records.append({
+                                "key": src["name"],
+                                "value": payload
+                            })
+            except Exception as exc:
+                print(f"[warn] source {src['name']} failed: {exc}", file=sys.stderr)
+                
+        print(f"scraped {len(records)} records from {len(SOURCES)} sources")
+        Kestra.outputs({
+            "records": records,
+            "record_count": len(records),
+        })
+
+  - id: produce_to_kafka
+    type: io.kestra.plugin.kafka.Produce
+    description: Publish each scraped record to the raw.rss Kafka topic.
+    topic: raw.rss
+    properties:
+      bootstrap.servers: "kafka:29092"
+      acks: "all"
+      enable.idempotence: "true"
+    serdeProperties:
+      keySerializer: "org.apache.kafka.common.serialization.StringSerializer"
+      valueSerializer: "org.apache.kafka.common.serialization.StringSerializer"
+    from: "{{ outputs.scrape_sources.vars.records }}"
+
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Ingestion complete: {{ outputs.scrape_sources.vars.record_count }} records
+      published to topic `raw.rss` (partition key = source_name).
