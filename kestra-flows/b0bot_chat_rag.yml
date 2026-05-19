@@ -1,0 +1,102 @@
+id: b0bot_chat_rag
+namespace: b0bot
+description: RAG-style chat over the B0bot knowledge base with dynamic Ingestion fallback.
+labels:
+  project: b0bot
+  stage: rag
+
+triggers:
+  - id: webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: "chat-secret-key"
+    returnOutputs: true
+    responseContentType: "application/json"
+
+tasks:
+  - id: search_articles
+    type: io.kestra.plugin.jdbc.postgresql.Query
+    url: "jdbc:postgresql://postgres:5432/kestra"
+    username: "kestra"
+    password: "k3str4"
+    fetchType: FETCH
+    sql: |
+      SELECT id, headline, source_url, category, severity, entities
+      FROM articles_metadata
+      WHERE 
+        headline ILIKE '%' || :q1 || '%'
+        OR (entities::text) ILIKE '%' || :q2 || '%'
+      ORDER BY id DESC LIMIT 8;
+    parameters:
+      q1: "{{ trigger.body.question | default('') }}"
+      q2: "{{ trigger.body.question | default('') }}"
+
+  - id: decide_answer
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: python:3.11-slim
+    env:
+      ROWS: "{{ outputs.search_articles.rows | default([]) | toJson }}"
+    beforeCommands:
+      - pip install --quiet kestra
+    commands:
+      - python decide.py
+    inputFiles:
+      decide.py: |
+        import json, os
+        from kestra import Kestra
+        rows = json.loads(os.environ.get("ROWS", "[]"))
+        if not rows:
+            Kestra.outputs({"answer": "__TRIGGER_INGEST__", "sources": [], "matched": 0})
+        else:
+            Kestra.outputs({"answer": "__RAG__", "sources": [r.get("source_url") for r in rows if r.get("source_url")], "matched": len(rows), "context": json.dumps(rows)})
+
+  - id: trigger_ingestion_subflow
+    type: io.kestra.plugin.core.flow.Subflow
+    runIf: "{{ outputs.decide_answer.vars.answer == '__TRIGGER_INGEST__' }}"
+    namespace: b0bot
+    flowId: b0bot_multi_source_ingest
+    wait: false
+    transmitFailed: false
+
+  - id: synthesize_answer
+    type: io.kestra.plugin.ai.agent.AIAgent
+    runIf: "{{ outputs.decide_answer.vars.answer == '__RAG__' }}"
+    systemMessage: Answer the user's question using only the supplied context.
+    prompt: |
+      Question: {{ trigger.body.question | default('') }}
+      Raw context payload: {{ outputs.decide_answer.vars.context }}
+    provider:
+      type: io.kestra.plugin.ai.provider.GoogleGemini
+      modelName: gemini-2.5-flash-lite
+      apiKey: "{{ envs.gemini_api_key ?? '' }}"
+    configuration:
+      responseFormat:
+        type: TEXT
+
+  - id: build_response
+    type: io.kestra.plugin.scripts.python.Commands
+    containerImage: python:3.11-slim
+    env:
+      DECIDED: "{{ outputs.decide_answer.vars | toJson }}"
+      SYNTH: "{% if outputs.synthesize_answer is defined %}{{ outputs.synthesize_answer.textOutput }}{% else %}{% endif %}"
+    beforeCommands:
+      - pip install --quiet kestra
+    commands:
+      - python build.py
+    inputFiles:
+      build.py: |
+        import json, os
+        from kestra import Kestra
+        decided = json.loads(os.environ.get("DECIDED", "{}"))
+        
+        if decided.get("answer") == "__RAG__":
+            payload = {"answer": os.environ.get("SYNTH", ""), "sources": decided.get("sources", []), "matched": decided.get("matched", 0)}
+        else:
+            # Safe fallback response notifying the user that the background pipeline has started
+            payload = {"answer": "This information is not found in the current database. I have triggered the B0bot ingestion pipeline to hunt for new intelligence regarding your query.", "sources": [], "matched": 0}
+            
+        Kestra.outputs(payload)
+
+outputs:
+  - id: response
+    type: JSON
+    value: "{{ outputs.build_response.vars | json }}"
