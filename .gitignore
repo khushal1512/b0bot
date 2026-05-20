@@ -50,3 +50,5 @@ next-env.d.ts
 # Misc
 coverage/
 .cache/
+frontend/package-lock.json
+frontend/pnpm-lock.yaml
