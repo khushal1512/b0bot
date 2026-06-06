@@ -1,6 +1,6 @@
 # B0bot
 <p align="center">
-  <img src="assets/Hero.png" alt="B0bot Hero" width="50% height=40%" />
+  <img src="assets/Hero.png" alt="B0bot Hero" width="70% height=60%" />
 </p>
 
 
